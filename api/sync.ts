@@ -1,12 +1,12 @@
 /**
- * Vercel Serverless Function: /api/sync
- * Performs the Pokémon data sync server-side to avoid CORS and client write restrictions.
- * - Uses Supabase service role to upsert into `sets` and `cards`
- * - Paginates the Pokémon cards API until all pages are processed
- * - Returns counts of processed rows
+ * Vercel Edge Function: /api/sync
+ * - Edge runtime avoids CommonJS/ESM issues and runs close to users.
+ * - Uses Supabase service role to upsert into `sets` and `cards`.
+ * - Paginates Pokémon API and returns counts.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database, TablesInsert } from "../src/database.types";
+export const config = { runtime: "edge" };
 
 type CardApi = {
   id: string;
@@ -43,23 +43,11 @@ function getApiHeaders(): HeadersInit {
   return headers;
 }
 
-interface VercelRequestLike {
-  method?: string;
-  headers: Record<string, string | string[] | undefined>;
-}
-
-interface VercelResponseLike {
-  setHeader: (name: string, value: string) => void;
-  status: (code: number) => VercelResponseLike;
-  json: (body: unknown) => void;
-  end: () => void;
-}
-
-function allowCors(res: VercelResponseLike): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-sync-token");
-}
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, x-sync-token",
+};
 
 function getSupabaseAdmin(): SupabaseClient<Database> {
   const url = process.env.SUPABASE_URL as string | undefined;
@@ -127,26 +115,30 @@ async function fetchCardsByPage(page: number, pageSize: number): Promise<CardApi
   return body.data ?? [];
 }
 
-export default async function handler(req: VercelRequestLike, res: VercelResponseLike) {
-  allowCors(res);
+export default async function handler(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") {
-    return res.status(204).end();
+    return new Response(null, { status: 204, headers: corsHeaders });
   }
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method Not Allowed" });
+    return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+      status: 405,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 
-  // Optional shared secret header to prevent public abuse
+  // Optional shared secret header to prevent abuse
   const expectedToken = process.env.SYNC_TOKEN as string | undefined;
-  const providedToken = (req.headers["x-sync-token"] as string | undefined) ?? undefined;
+  const providedToken = req.headers.get("x-sync-token") ?? undefined;
   if (expectedToken && expectedToken.length > 0) {
     if (!providedToken || providedToken !== expectedToken) {
-      return res.status(401).json({ error: "Unauthorized" });
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
   }
 
   const supabase = getSupabaseAdmin();
-
   try {
     // Sync sets
     const sets = await fetchAllSets();
@@ -183,7 +175,10 @@ export default async function handler(req: VercelRequestLike, res: VercelRespons
       finished_at: new Date().toISOString(),
     });
 
-    return res.status(200).json({ setsUpserted: setInserts.length, cardsUpserted });
+    return new Response(
+      JSON.stringify({ setsUpserted: setInserts.length, cardsUpserted }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   } catch (e) {
     const message = e instanceof Error ? e.message : "Unknown error";
     await supabase.from("sync_runs").insert({
@@ -192,7 +187,10 @@ export default async function handler(req: VercelRequestLike, res: VercelRespons
       notes: { error: message } as Database["public"]["Tables"]["sync_runs"]["Row"]["notes"],
       finished_at: new Date().toISOString(),
     });
-    return res.status(500).json({ error: message });
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 }
 
