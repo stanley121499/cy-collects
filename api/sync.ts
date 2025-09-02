@@ -140,43 +140,52 @@ export default async function handler(req: Request): Promise<Response> {
 
   const supabase = getSupabaseAdmin();
   try {
-    // Sync sets
-    const sets = await fetchAllSets();
-    const setInserts = sets.map(mapSetToInsert);
-    if (setInserts.length > 0) {
-      const { error } = await supabase
-        .from("sets")
-        .upsert(setInserts, { onConflict: "id", ignoreDuplicates: false });
-      if (error) throw new Error(error.message);
+    // Read body for step/pagination
+    let body: { step?: string; page?: number; pageSize?: number } = {};
+    try {
+      body = (await req.json()) as typeof body;
+    } catch (_) {
+      body = {};
     }
 
-    // Sync cards by pages
-    let cardsUpserted = 0;
-    const pageSize = 250;
-    let page = 1;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const data = await fetchCardsByPage(page, pageSize);
-      if (data.length === 0) break;
-      const upserts = data.map(mapCardToInsert);
+    const step = (body.step ?? "sets") as "sets" | "cards";
+    const page = typeof body.page === "number" && body.page > 0 ? body.page : 1;
+    const pageSize = typeof body.pageSize === "number" && body.pageSize > 0 ? body.pageSize : 250;
+
+    if (step === "sets") {
+      const sets = await fetchAllSets();
+      const setInserts = sets.map(mapSetToInsert);
+      if (setInserts.length > 0) {
+        const { error } = await supabase
+          .from("sets")
+          .upsert(setInserts, { onConflict: "id", ignoreDuplicates: false });
+        if (error) throw new Error(error.message);
+      }
+      await supabase.from("sync_runs").insert({
+        job: "seed_cards",
+        ok: true,
+        notes: { sets: setInserts.length, step: "sets" } as Database["public"]["Tables"]["sync_runs"]["Row"]["notes"],
+        finished_at: new Date().toISOString(),
+      });
+
+      return new Response(
+        JSON.stringify({ step: "sets", setsUpserted: setInserts.length, next: { step: "cards", page: 1, pageSize } }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // step === 'cards' → process a single page per request
+    const data = await fetchCardsByPage(page, pageSize);
+    const upserts = data.map(mapCardToInsert);
+    if (upserts.length > 0) {
       const { error } = await supabase
         .from("cards")
         .upsert(upserts, { onConflict: "id", ignoreDuplicates: false });
       if (error) throw new Error(error.message);
-      cardsUpserted += upserts.length;
-      if (data.length < pageSize) break;
-      page += 1;
     }
-
-    await supabase.from("sync_runs").insert({
-      job: "seed_cards",
-      ok: true,
-      notes: { sets: setInserts.length, cards: cardsUpserted } as Database["public"]["Tables"]["sync_runs"]["Row"]["notes"],
-      finished_at: new Date().toISOString(),
-    });
-
+    const hasMore = data.length === pageSize;
     return new Response(
-      JSON.stringify({ setsUpserted: setInserts.length, cardsUpserted }),
+      JSON.stringify({ step: "cards", processed: upserts.length, page, pageSize, hasMore, nextPage: hasMore ? page + 1 : null }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (e) {
